@@ -201,14 +201,13 @@ class ContextOverride:
 		# if the settings rely on a specific viewport / SpaceView3D
 		elif (self.__addon_settings_scene.viewportMode != 'CUSTOM' or force_context_data == True) and space_data != None:
 
-			# if CYCLES is activated in the current viewport
-			if space_data.shading.type == 'RENDERED' and self.__context.engine == 'CYCLES':
-
-				# change the shading type to SOLID
+			# Block any RENDERED mode (Cycles or EEVEE) for lightfield views.
+			# In EEVEE Next (Blender 4.2+) each draw_view3d call in RENDERED mode
+			# allocates shadow maps, light caches and render passes.  Across 45
+			# views this fills VRAM rapidly.  SOLID/Workbench has no such overhead.
+			if space_data.shading.type == 'RENDERED':
 				self.__override['space_data'].shading.type = 'SOLID'
-
-				# notify user
-				self.report({"WARNING"}, "Render engine (%s) not supported in lightfield previews. Switched to SOLID mode." % self.__context.engine)
+				LookingGlassAddonLogger.warning("Rendered viewport mode (%s) is not supported for lightfield previews — switched to SOLID." % self.__context.engine)
 
 		# always disable the hdri preview spheres
 		self.__override['space_data'].overlay.show_look_dev = False
@@ -298,6 +297,12 @@ class LOOKINGGLASS_OT_render_viewport(bpy.types.Operator):
 	skip_views = 1
 	restricted_viewcone_limit = 0
 
+	# Single shared offscreen used for all view renders.
+	# Using one offscreen instead of one-per-view prevents EEVEE Next from
+	# creating a separate engine context (shadow maps, light cache, render
+	# passes) for every view, which was the primary source of the memory leak.
+	_render_offscreen = None
+
 	# DEBUGING VARIABLES
 	start_multi_view = 0
 
@@ -351,21 +356,13 @@ class LOOKINGGLASS_OT_render_viewport(bpy.types.Operator):
 		# log info
 		LookingGlassAddonLogger.info(" [#] Cancelled control handlers.")
 
-		# iterate through all presets
-		for i, preset in self.qs.items():
-
-			# loop through all required views
-			#for view in range(int((self.qs[self.preset]["total_views"] + 1) / 3), self.qs[self.preset]["total_views"] - int((self.qs[self.preset]["total_views"] + 1) / 3)):
-			for view in range(0, len(self.qs[i]["viewOffscreen"])):
-
-				# free the GPUOffscreen for the view rendering
-				self.qs[i]["viewOffscreen"][view].free()
-
-			# delete the list of offscreen objects
-			self.qs[i]["viewOffscreen"].clear()
+		# free the shared rendering offscreen
+		if self._render_offscreen:
+			self._render_offscreen.free()
+			self._render_offscreen = None
 
 		# log info
-		LookingGlassAddonLogger.info(" [#] Freed GPUOffscreens of the lightfield views.")
+		LookingGlassAddonLogger.info(" [#] Freed shared GPUOffscreen.")
 
 		# set status variables to default state
 		#LookingGlassAddon.BlenderWindow = None
@@ -411,21 +408,20 @@ class LOOKINGGLASS_OT_render_viewport(bpy.types.Operator):
 		# get all quilt presets from pylio
 		self.qs = pylio.LookingGlassQuilt.formats.get()
 
-		# iterate through all presets
-		for i, preset in self.qs.items():
-
-			# create a list of offscreen objects for this preset
-			self.qs[i]["viewOffscreen"] = []
-
-			# loop through all required views
-			#for view in range(int((self.qs[self.preset]["total_views"] + 1) / 3), self.qs[self.preset]["total_views"] - int((self.qs[self.preset]["total_views"] + 1) / 3)):
-			for view in range(0, self.qs[i]["total_views"]):
-
-				# create a GPUOffscreen for the views
-				self.qs[i]["viewOffscreen"].append(gpu.types.GPUOffScreen(int(self.qs[i]["view_width"]), int(self.qs[i]["view_height"])))
+		# Create a single shared GPUOffscreen for rendering all views.
+		# Previously one offscreen per view per preset was allocated (~270 objects),
+		# causing EEVEE Next to spin up a full engine context per offscreen
+		# (shadow maps, light caches, render passes) which filled VRAM rapidly.
+		# With one shared offscreen, EEVEE keeps a single context regardless of
+		# view count.  Pixel data is read back after each view before the next
+		# render overwrites the buffer.
+		self._render_offscreen = gpu.types.GPUOffScreen(
+			int(self.qs[self.preset]["view_width"]),
+			int(self.qs[self.preset]["view_height"]),
+		)
 
 		# log info
-		LookingGlassAddonLogger.info(" [#] Prepared GPUOffscreens for view rendering.")
+		LookingGlassAddonLogger.info(" [#] Prepared shared GPUOffscreen for view rendering (%i x %i)." % (self.qs[self.preset]["view_width"], self.qs[self.preset]["view_height"]))
 
 
 		# PREPARE THE OVERRIDE CONTEXT THAT CONTAINS THE RENDER SETTINGS
@@ -747,7 +743,7 @@ class LOOKINGGLASS_OT_render_viewport(bpy.types.Operator):
 			self.start_multi_view = time.time()
 
 			# if the quilt and view settings changed
-			if self.last_preset != self.preset or self.lightfield_image == None:
+			if self.last_preset != self.preset or self.lightfield_image is None:
 
 				# update the preset variable
 				self.last_preset = self.preset
@@ -757,6 +753,14 @@ class LOOKINGGLASS_OT_render_viewport(bpy.types.Operator):
 
 				# delete the current LightfieldImage
 				if self.lightfield_image: self.lightfield_image = None
+
+				# Reallocate the shared offscreen at the new view resolution.
+				if self._render_offscreen:
+					self._render_offscreen.free()
+				self._render_offscreen = gpu.types.GPUOffScreen(
+					int(self.qs[self.preset]["view_width"]),
+					int(self.qs[self.preset]["view_height"]),
+				)
 
 				# create a pylio LightfieldImage
 				self.lightfield_image = pylio.LightfieldImage.new(pylio.LookingGlassQuilt, id=self.preset, colormode='RGBA')
@@ -806,93 +810,58 @@ class LOOKINGGLASS_OT_render_viewport(bpy.types.Operator):
 
 				# RENDER THE VIEWS
 				# ++++++++++++++++++++++++++++++++++++++++++++++++
+				# Each view is rendered into the single shared offscreen and its
+				# pixels are read back immediately before the next view overwrites
+				# the buffer.  This keeps peak GPU memory at one view's worth of
+				# data rather than one per view, and ensures EEVEE Next only ever
+				# holds a single engine context instead of one per offscreen.
 
-				# loop through all required views
 				for view in range(0, self.qs[self.preset]["total_views"]):
 
-					with self.qs[self.preset]["viewOffscreen"][view].bind():
-
-						start_test = time.time()
-						# calculate the offset-projection of the current view
-						view_matrix, projection_matrix = self.setupVirtualCameraForView(view, camera_view_matrix.copy(), camera_projection_matrix.copy())
-
-						LookingGlassAddonLogger.debug(" [#] [%i] Setting up view camera took %.3f ms" % (view, (time.time() - start_test) * 1000))
-						start_test = time.time()
-
-						# if the "skip views preview" is activated AND this view shall be skipped
-						if (self.addon_settings_window_manager.viewport_use_preview_mode and (self.addon_settings_window_manager.lightfield_preview_mode == '2' or self.addon_settings_window_manager.lightfield_preview_mode == '3')) and view % self.skip_views:
-
-							# clear LightfieldView array's color data (so it appears black)
-							self.lightfield_image.views[view]['view'].data[:] = 0
-
-							LookingGlassAddonLogger.debug(" [#] [%i] Clearing skipped view's numpy array took %.3f ms" % (view, (time.time() - start_test) * 1000))
-
-						# if the "Restricted viewcone preview" is activated AND this view shall be skipped
-						elif (self.addon_settings_window_manager.viewport_use_preview_mode and self.addon_settings_window_manager.lightfield_preview_mode == '4') and (view < self.restricted_viewcone_limit or view > self.qs[self.preset]["total_views"] - self.restricted_viewcone_limit):
-
-							# clear LightfieldView array's color data (so it appears black)
-							self.lightfield_image.views[view]['view'].data[:] = 0
-
-							LookingGlassAddonLogger.debug(" [#] [%i] Clearing skipped view's numpy array took %.3f ms" % (view, (time.time() - start_test) * 1000))
-
-						else:
-
-							# if the lightfield window is not active anymore, stop
-							if not (context or context.window_manager.addon_settings.ShowLightfieldWindow):
-								continue
-
-							# draw the viewport rendering to the offscreen for the current view
-							self.qs[self.preset]["viewOffscreen"][view].draw_view3d(
-								# we use the "Scene" and the "View Layer" that is active in the Window
-								# the user currently works in
-								scene=context.scene,
-								view_layer=context.view_layer,
-								view3d=self._override.space_data,
-								region=self._override.region,
-								view_matrix=view_matrix,
-								projection_matrix=projection_matrix,
-								do_color_management = True)
-
-							LookingGlassAddonLogger.debug(" [#] [%i] Drawing view into offscreen took %.3f ms" % (view, (time.time() - start_test) * 1000))
-
-				# restore all viewport shading and overlay settings
-				self.restoreViewportSettings()
-
-				LookingGlassAddonLogger.debug("-----------------------------")
-				LookingGlassAddonLogger.debug("Rendering all views took in total %.3f ms" % ((time.time() - self.start_multi_view) * 1000))
-				LookingGlassAddonLogger.debug("-----------------------------")
-
-
-				# COPY THE VIEWS INTO A BUFFER
-				# NOTE: We do this in a separate loop, because for an unknown
-				#		reason (probably something Blender internal), it is faster.
-				# ++++++++++++++++++++++++++++++++++++++++++++++++
-
-				self.start_multi_view = time.time()
-
-				# loop through all required views
-				for view in range(0, self.qs[self.preset]["total_views"]):
+					start_test = time.time()
 
 					# if the "skip views preview" is activated AND this view shall be skipped
 					if (self.addon_settings_window_manager.viewport_use_preview_mode and (self.addon_settings_window_manager.lightfield_preview_mode == '2' or self.addon_settings_window_manager.lightfield_preview_mode == '3')) and view % self.skip_views:
 
+						# clear LightfieldView array's color data (so it appears black)
+						self.lightfield_image.views[view]['view'].data[:] = 0
 						continue
+
 					# if the "Restricted viewcone preview" is activated AND this view shall be skipped
 					elif (self.addon_settings_window_manager.viewport_use_preview_mode and self.addon_settings_window_manager.lightfield_preview_mode == '4') and (view < self.restricted_viewcone_limit or view > self.qs[self.preset]["total_views"] - self.restricted_viewcone_limit):
 
+						# clear LightfieldView array's color data (so it appears black)
+						self.lightfield_image.views[view]['view'].data[:] = 0
 						continue
-					else:
 
-						start_test = time.time()
+					# if the lightfield window is not active anymore, stop
+					if not (context or context.window_manager.addon_settings.ShowLightfieldWindow):
+						continue
 
-						# copy texture into LightfieldView array
-						self.from_texture_to_numpy_array(self.qs[self.preset]["viewOffscreen"][view], self.lightfield_image.views[view]['view'].data[:])
+					# calculate the offset-projection for this view
+					view_matrix_v, projection_matrix_v = self.setupVirtualCameraForView(view, camera_view_matrix.copy(), camera_projection_matrix.copy())
 
-						LookingGlassAddonLogger.debug(" [#] [%i] Copying texture to numpy array took %.3f ms" % (view, (time.time() - start_test) * 1000))
+					# render this view into the shared offscreen
+					self._render_offscreen.draw_view3d(
+						scene=context.scene,
+						view_layer=context.view_layer,
+						view3d=self._override.space_data,
+						region=self._override.region,
+						view_matrix=view_matrix_v,
+						projection_matrix=projection_matrix_v,
+						do_color_management=True,
+					)
 
-				LookingGlassAddonLogger.debug("-----------------------------")
-				LookingGlassAddonLogger.debug("Copying all views took in total %.3f ms" % ((time.time() - self.start_multi_view) * 1000))
-				LookingGlassAddonLogger.debug("-----------------------------")
+					# immediately read pixels back into the LightfieldView numpy array
+					# before the next view render overwrites the buffer
+					self.from_texture_to_numpy_array(self._render_offscreen, self.lightfield_image.views[view]['view'].data[:])
+
+					LookingGlassAddonLogger.debug(" [#] [%i] Render + readback took %.3f ms" % (view, (time.time() - start_test) * 1000))
+
+				# restore all viewport shading and overlay settings
+				self.restoreViewportSettings()
+
+				LookingGlassAddonLogger.debug("All %i views rendered in %.3f ms" % (self.qs[self.preset]["total_views"], (time.time() - self.start_multi_view) * 1000))
 
 			# reset draw variable:
 			# This is here to prevent excessive redrawing
