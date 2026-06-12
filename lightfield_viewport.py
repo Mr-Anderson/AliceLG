@@ -126,37 +126,35 @@ class ContextOverride:
 
 
 
+	# The exact set of shading/overlay attributes that updateViewportSettings()
+	# may modify.  Saving and restoring only these is far cheaper than iterating
+	# over every attribute returned by dir().
+	_SHADING_ATTRS = ('type', 'show_xray', 'xray_alpha', 'use_dof')
+	_OVERLAY_ATTRS = (
+		'show_floor', 'show_axis_x', 'show_axis_y', 'show_axis_z', 'grid_scale',
+		'show_extras', 'show_relationship_lines', 'show_outline_selected',
+		'show_bones', 'show_motion_paths', 'show_object_origins',
+		'show_object_origins_all', 'show_wireframes', 'show_face_orientation',
+		'show_look_dev',
+	)
+
 	# Save the viewport settings
 	def saveViewportSettings(self):
 
-		# SHADING ATTRIBUTES
-		# define some exceptions that must not be taken into
-		attributeExceptions = ["__doc__", "__module__", "__slots__", "bl_rna", "rna_type", "color_type", "studio_light"]
+		shading = self.__override['space_data'].shading
+		overlay = self.__override['space_data'].overlay
 
-		# use the "space data" of the selected viewport
-		attributeList = dir(self.__override['space_data'].shading)
-		for attr in attributeList:
+		for attr in self._SHADING_ATTRS:
+			try:
+				self.__shading_restore_backup[attr] = getattr(shading, attr)
+			except Exception:
+				pass
 
-			if not attr in attributeExceptions and hasattr(self.__override['space_data'].shading, attr):
-				#print("[SHADING]", attr, " = ", getattr(LookingGlassAddon.BlenderViewport.shading, attr))
-
-				try:
-					self.__shading_restore_backup[attr] = getattr(self.__override['space_data'].shading, attr)
-				except Exception as e:
-					#print(" # ", e)
-					pass
-
-		attributeList = dir(self.__override['space_data'].overlay)
-		for attr in attributeList:
-
-			if not attr in attributeExceptions and hasattr(self.__override['space_data'].overlay, attr):
-				#print("[OVERLAY]", attr, " = ", getattr(self.__override['space_data'].overlay, attr))
-
-				try:
-					self.__overlay_restore_backup[attr] = getattr(self.__override['space_data'].overlay, attr)
-				except Exception as e:
-					#print(" # ", e)
-					pass
+		for attr in self._OVERLAY_ATTRS:
+			try:
+				self.__overlay_restore_backup[attr] = getattr(overlay, attr)
+			except Exception:
+				pass
 
 
 	# Update the viewport settings
@@ -218,36 +216,22 @@ class ContextOverride:
 	# Restore the viewport settings
 	def restoreViewportSettings(self):
 
-		# SHADING ATTRIBUTES
-		# define some exceptions that must not be taken into
-		attributeExceptions = ["__doc__", "__module__", "__slots__", "bl_rna", "rna_type", "color_type", "studio_light", "type"]
+		shading = self.__override['space_data'].shading
+		overlay = self.__override['space_data'].overlay
 
-		# use the "space data" of the selected viewport
-		attributeList = dir(self.__override['space_data'].shading)
-		for attr in attributeList:
+		for attr, saved in self.__shading_restore_backup.items():
+			try:
+				if getattr(shading, attr) != saved:
+					setattr(shading, attr, saved)
+			except Exception:
+				pass
 
-			if not attr in attributeExceptions and hasattr(self.__override['space_data'].shading, attr):
-				if getattr(self.__override['space_data'].shading, attr) != self.__shading_restore_backup[attr]:
-				#print("[SHADING]", attr, " = ", self.__shading_restore_backup[attr])
-
-					try:
-						setattr(self.__override['space_data'].shading, attr, self.__shading_restore_backup[attr])
-					except Exception as e:
-						#print(" # ", e)
-						pass
-
-		attributeList = dir(self.__override['space_data'].overlay)
-		for attr in attributeList:
-
-			if not attr in attributeExceptions and hasattr(self.__override['space_data'].overlay, attr):
-				if getattr(self.__override['space_data'].overlay, attr) != self.__overlay_restore_backup[attr]:
-				# print("[OVERLAY]", attr, " = ", self.__overlay_restore_backup[attr])
-
-					try:
-						setattr(self.__override['space_data'].overlay, attr, self.__overlay_restore_backup[attr])
-					except Exception as e:
-						#print(" # ", e)
-						pass
+		for attr, saved in self.__overlay_restore_backup.items():
+			try:
+				if getattr(overlay, attr) != saved:
+					setattr(overlay, attr, saved)
+			except Exception:
+				pass
 
 	# CLASS PROPERTIES
 	# ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
@@ -741,45 +725,15 @@ class LOOKINGGLASS_OT_render_viewport(bpy.types.Operator):
 
 	@staticmethod
 	def from_texture_to_numpy_array(offscreen, array):
-		"""copy the current texture to a numpy array"""
+		"""Copy the bound offscreen texture into a numpy array via gpu.types.Buffer."""
 
 		with offscreen.bind():
 
-			# TODO: IN LATER VERSIONS OF ALICE/LG THAT DO NOT SUPPORT 2.93
-			#		 ANYMORE, THE bgl.* CALLS SHOULD BE REMOVED
-			# for Blender versions earlier than 3.0 (prior to the major BGL changes)
-			if bpy.app.version < (3, 0, 0):
-
-				import bgl
-
-				# activate the texture
-				bgl.glActiveTexture(bgl.GL_TEXTURE0)
-				bgl.glBindTexture(bgl.GL_TEXTURE_2D, offscreen.color_texture)
-
-				# then we pass the numpy array to the bgl.Buffer as template,
-				# which causes Blender to write the buffer data into the numpy array directly
-				buffer = bgl.Buffer(bgl.GL_BYTE, array.shape, array)
-
-				# set correct colormode
-				if array.shape[2] == 3: colormode = bgl.GL_RGB
-				if array.shape[2] == 4: colormode = bgl.GL_RGBA
-
-				# write pixel data from texture into the buffer (numpy array)
-				bgl.glGetTexImage(bgl.GL_TEXTURE_2D, 0, colormode, bgl.GL_UNSIGNED_BYTE, buffer)
-				bgl.glBindTexture(bgl.GL_TEXTURE_2D, 0)
-
-			# for Blender versions later than 3.0 (after the major BGL changes)
-			else:
-
-				# then we pass the numpy array to the gpu.types.Buffer as template,
-				# which causes Blender to write the buffer data into the numpy array directly
-				buffer = gpu.types.Buffer('UBYTE', array.shape, array)
-
-				# get the active framebuffer
-				framebuffer = gpu.state.active_framebuffer_get()
-
-				# write pixel data from texture into the buffer (numpy array)
-				framebuffer.read_color(0, 0, array.shape[1], array.shape[0], array.shape[2], 0, 'UBYTE', data=buffer)
+			# gpu.types.Buffer uses the numpy array as the write target directly,
+			# avoiding an extra copy.  bgl (removed in Blender 4.0) is no longer used.
+			buffer = gpu.types.Buffer('UBYTE', array.shape, array)
+			framebuffer = gpu.state.active_framebuffer_get()
+			framebuffer.read_color(0, 0, array.shape[1], array.shape[0], array.shape[2], 0, 'UBYTE', data=buffer)
 
 	# Draw function which copies data from the 3D View
 	def render_view(self, context):
@@ -803,21 +757,6 @@ class LOOKINGGLASS_OT_render_viewport(bpy.types.Operator):
 
 				# delete the current LightfieldImage
 				if self.lightfield_image: self.lightfield_image = None
-
-				# TODO: Actually we would use "RGB" and a numpy array with 3
-				#		color channels, because that would be more efficient.
-				#		But we can't read in RGB mode to gpu.types.Buffer
-				#	   due to Blender's default OpenGL settings:
-				#
-				#	   https://developer.blender.org/T91828
-				#
-				#		If we don't so it that way, it causes crashes:
-				#
-				#		https://github.com/regcs/AliceLG/issues/59
-				#
-				#		The Blender behaviour was fixed for v.3.0+. At the
-				#		point when Alice/LG does not support 2.93 anymore,
-				#		we can change this. (because the Blender fix is not)
 
 				# create a pylio LightfieldImage
 				self.lightfield_image = pylio.LightfieldImage.new(pylio.LookingGlassQuilt, id=self.preset, colormode='RGBA')
@@ -979,6 +918,13 @@ class FrustumRenderer:
 		self.frustum_indices_focalplane_face = None
 		self.frustum_shader = None
 
+		# Cached GPU batches — rebuilt only when the frustum geometry changes.
+		self._batch_lines = None
+		self._batch_faces = None
+		self._batch_focalplane_outline = None
+		self._batch_focalplane_face = None
+		self._cached_coords_key = None
+
 		# notify addon that frustum is activated
 		LookingGlassAddon.FrustumInitialized = True
 
@@ -1072,11 +1018,9 @@ class FrustumRenderer:
 				(10, 11, 8)
 			)
 
-		# compile the shader that will be used for drawing
-		if sys.version_info.major >= 4 or (sys.version_info.major >= 0 and sys.version_info.minor >= 0):
-			self.frustum_shader = gpu.shader.from_builtin('UNIFORM_COLOR')
-		else:
-			self.frustum_shader = gpu.shader.from_builtin('3D_UNIFORM_COLOR')
+		# UNIFORM_COLOR replaced the old 3D_UNIFORM_COLOR in Blender 3.4.
+		# Since we now require Blender 4.0+ the old name is never needed.
+		self.frustum_shader = gpu.shader.from_builtin('UNIFORM_COLOR')
 
 
 
@@ -1116,7 +1060,6 @@ class FrustumRenderer:
 						clipEnd = camera.data.clip_end
 						focalPlane = context.scene.addon_settings.focalPlane
 
-						# TODO: Find a way to predefine the vertex buffers and batches so that these don't need to be created in every frame
 						# define the vertices of the camera frustum in camera coordinates
 						# NOTE: - the z-value is negative, because the Blender camera always looks into negative z-direction
 						coords_local = [
@@ -1131,15 +1074,28 @@ class FrustumRenderer:
 										(view_frame_upper_left[0] / view_frame_distance * focalPlane, view_frame_upper_left[1] / view_frame_distance * focalPlane, -focalPlane), (view_frame_upper_right[0] / view_frame_distance * focalPlane, view_frame_upper_right[1] / view_frame_distance * focalPlane, -focalPlane),
 										]
 
-						# if the camera fustum shall be drawn
-						if context.scene.addon_settings.showFrustum == True:
-							batch_lines = batch_for_shader(self.frustum_shader, 'LINES', {"pos": coords_local}, indices=self.frustum_indices_lines)
-							batch_faces = batch_for_shader(self.frustum_shader, 'TRIS', {"pos": coords_local}, indices=self.frustum_indices_faces)
-
-						# if the focal plane shall be drawn
-						if context.scene.addon_settings.showFocalPlane == True:
-							batch_focalplane_outline = batch_for_shader(self.frustum_shader, 'LINES', {"pos": coords_local}, indices=self.frustum_indices_focalplane_outline)
-							batch_focalplane_face = batch_for_shader(self.frustum_shader, 'TRIS', {"pos": coords_local}, indices=self.frustum_indices_focalplane_face)
+						# Rebuild GPU batches only when the frustum geometry actually changed.
+						# Batches are expensive to allocate; recreating them every draw call
+						# was a significant performance bottleneck.
+						coords_key = (
+							tuple(coords_local[0]), tuple(coords_local[4]), tuple(coords_local[8]),
+							context.scene.addon_settings.showFrustum,
+							context.scene.addon_settings.showFocalPlane,
+						)
+						if coords_key != self._cached_coords_key:
+							self._cached_coords_key = coords_key
+							if context.scene.addon_settings.showFrustum:
+								self._batch_lines = batch_for_shader(self.frustum_shader, 'LINES', {"pos": coords_local}, indices=self.frustum_indices_lines)
+								self._batch_faces = batch_for_shader(self.frustum_shader, 'TRIS', {"pos": coords_local}, indices=self.frustum_indices_faces)
+							else:
+								self._batch_lines = None
+								self._batch_faces = None
+							if context.scene.addon_settings.showFocalPlane:
+								self._batch_focalplane_outline = batch_for_shader(self.frustum_shader, 'LINES', {"pos": coords_local}, indices=self.frustum_indices_focalplane_outline)
+								self._batch_focalplane_face = batch_for_shader(self.frustum_shader, 'TRIS', {"pos": coords_local}, indices=self.frustum_indices_focalplane_face)
+							else:
+								self._batch_focalplane_outline = None
+								self._batch_focalplane_face = None
 
 						# draw everything
 						self.frustum_shader.bind()
@@ -1158,31 +1114,31 @@ class FrustumRenderer:
 						gpu.state.depth_mask_set(True)
 
 						# if the camera fustum shall be drawn
-						if context.scene.addon_settings.showFrustum == True:
+						if self._batch_lines:
 							# draw outline
 							self.frustum_shader.uniform_float("color", (0.3, 0, 0, 1))
-							batch_lines.draw(self.frustum_shader)
+							self._batch_lines.draw(self.frustum_shader)
 
 						# if the focal plane shall be drawn
-						if context.scene.addon_settings.showFocalPlane == True:
+						if self._batch_focalplane_outline:
 							# draw focal plane outline
 							self.frustum_shader.uniform_float("color", (1, 1, 1, 1))
-							batch_focalplane_outline.draw(self.frustum_shader)
+							self._batch_focalplane_outline.draw(self.frustum_shader)
 
 						gpu.state.depth_mask_set(False)
 						gpu.state.blend_set('ALPHA')
 
 						# if the camera fustum shall be drawn
-						if context.scene.addon_settings.showFrustum == True:
+						if self._batch_faces:
 							# fill faces
 							self.frustum_shader.uniform_float("color", (0.5, 0.5, 0.5, 0.05))
-							batch_faces.draw(self.frustum_shader)
+							self._batch_faces.draw(self.frustum_shader)
 
 						# if the focal plane shall be drawn
-						if context.scene.addon_settings.showFocalPlane == True:
+						if self._batch_focalplane_face:
 							# draw focal plane face
 							self.frustum_shader.uniform_float("color", (0.1, 0.1, 0.1, 0.25))
-							batch_focalplane_face.draw(self.frustum_shader)
+							self._batch_focalplane_face.draw(self.frustum_shader)
 
 						gpu.state.depth_test_set('NONE')
 						gpu.state.blend_set('NONE')
@@ -2337,7 +2293,6 @@ class BlockRenderer:
 
 								# if the texture was created
 								if block.image_texture:
-									print(f"Texture created: {block.image_texture.width}x{block.image_texture.height}, Format: {block.image_texture.format}")
 
 									# calculate view grid indices in the quilt
 									view_ix = block.view % block.qs[block.preset]['columns']

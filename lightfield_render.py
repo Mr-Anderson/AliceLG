@@ -1670,8 +1670,9 @@ class LOOKINGGLASS_OT_render_quilt(bpy.types.Operator):
 
 			# HANDLER FOR EVENT TIMER
 			# ++++++++++++++++++++++++++++++++++
-			# Create timer event that runs every 1 ms to check the rendering process
-			self._handle_event_timer = context.window_manager.event_timer_add(0.001, window=context.window)
+			# 50 ms cadence: fast enough to catch state transitions without
+			# hammering the CPU while Blender's own render loop is running.
+			self._handle_event_timer = context.window_manager.event_timer_add(0.05, window=context.window)
 
 			# add the modal operator handler
 			context.window_manager.modal_handler_add(self)
@@ -1697,6 +1698,11 @@ class LOOKINGGLASS_OT_render_quilt(bpy.types.Operator):
 		# +++++++++++++++++++++++++++++++++++++++++++
 		self.render_settings.addon_settings.render_progress = self.render_settings.job.update_progress()
 
+		# Force all UI panels to redraw so the progress bar stays live.
+		for window in context.window_manager.windows:
+			for area in window.screen.areas:
+				if area.type in {'PROPERTIES', 'VIEW_3D'}:
+					area.tag_redraw()
 
 
 		# PROCESS MODAL EVENTS
